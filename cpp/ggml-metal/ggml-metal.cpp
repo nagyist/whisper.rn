@@ -202,6 +202,10 @@ static size_t wsp_ggml_backend_metal_buffer_type_get_alloc_size(wsp_ggml_backend
             {
                 res *= 2;
             } break;
+        case WSP_GGML_OP_TOP_K:
+            {
+                res = 2*sizeof(int32_t)*wsp_ggml_nelements(tensor->src[0]);
+            } break;
         default:
             break;
     }
@@ -621,14 +625,11 @@ static int64_t get_op_batch_size(const wsp_ggml_tensor * op) {
 }
 
 static bool wsp_ggml_backend_metal_device_offload_op(wsp_ggml_backend_dev_t dev, const wsp_ggml_tensor * op) {
-    const int min_batch_size = 32;
+    wsp_ggml_metal_device_t ctx_dev = (wsp_ggml_metal_device_t)dev->context;
 
     return (op->op == WSP_GGML_OP_MUL_MAT ||
             op->op == WSP_GGML_OP_MUL_MAT_ID) &&
-            get_op_batch_size(op) >= min_batch_size;
-
-    WSP_GGML_UNUSED(dev);
-    WSP_GGML_UNUSED(op);
+            get_op_batch_size(op) >= wsp_ggml_metal_device_get_props(ctx_dev)->op_offload_min_batch_size;
 }
 
 static wsp_ggml_backend_device_i wsp_ggml_backend_metal_device_i = {
