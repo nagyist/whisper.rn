@@ -7,11 +7,15 @@
 #include "ggml-metal-context.h"
 #include "ggml-metal-ops.h"
 
-// globals
+#include <mutex>
+#include <string>
 
-// initialized in wsp_ggml_backend_metal_reg
-static wsp_ggml_backend_reg    g_wsp_ggml_metal_reg;
-static wsp_ggml_backend_device g_wsp_ggml_metal_device;
+#define WSP_GGML_METAL_NAME "MTL"
+#define WSP_GGML_METAL_MAX_DEVICES 16
+
+// number of Metal devices
+// note: can be overriden with WSP_GGML_METAL_DEVICES env to simulate virtual devices
+static int g_devices = 1;
 
 ////////////////////////////////////////////////////////////////////////////////
 // backend interface
@@ -165,9 +169,27 @@ static wsp_ggml_backend_buffer_i wsp_ggml_backend_metal_buffer_private_i = {
     /* .reset           = */ NULL,
 };
 
+static bool wsp_ggml_backend_buffer_is_metal(wsp_ggml_backend_buffer_t buffer) {
+    return buffer->iface.free_buffer == wsp_ggml_backend_metal_buffer_shared_free_buffer ||
+           buffer->iface.free_buffer == wsp_ggml_backend_metal_buffer_private_free_buffer;
+}
+
 //
 // buffer types
 //
+
+struct wsp_ggml_backend_metal_buffer_type {
+    int device;
+    std::string name;
+};
+
+struct wsp_ggml_backend_metal_buffer_type_deleter {
+    void operator()(wsp_ggml_backend_metal_buffer_type * ctx) const {
+        delete ctx;
+    }
+};
+
+typedef std::unique_ptr<wsp_ggml_backend_metal_buffer_type, wsp_ggml_backend_metal_buffer_type_deleter> wsp_ggml_backend_metal_buffer_type_ptr;
 
 // common method for allocating shread or private Metal buffers
 static wsp_ggml_backend_buffer_t wsp_ggml_backend_metal_buffer_type_alloc_buffer(wsp_ggml_backend_buffer_type_t buft, size_t size, bool shared) {
@@ -218,9 +240,9 @@ static size_t wsp_ggml_backend_metal_buffer_type_get_alloc_size(wsp_ggml_backend
 // default (shared) buffer type
 
 static const char * wsp_ggml_backend_metal_buffer_type_shared_get_name(wsp_ggml_backend_buffer_type_t buft) {
-    return "Metal";
+    wsp_ggml_backend_metal_buffer_type * ctx = (wsp_ggml_backend_metal_buffer_type *)buft->context;
 
-    WSP_GGML_UNUSED(buft);
+    return ctx->name.c_str();
 }
 
 static wsp_ggml_backend_buffer_t wsp_ggml_backend_metal_buffer_type_shared_alloc_buffer(wsp_ggml_backend_buffer_type_t buft, size_t size) {
@@ -249,29 +271,54 @@ static bool wsp_ggml_backend_metal_buffer_type_shared_is_host(wsp_ggml_backend_b
     WSP_GGML_UNUSED(buft);
 }
 
-static wsp_ggml_backend_buffer_type_t wsp_ggml_backend_metal_buffer_type_shared(void) {
-    static wsp_ggml_backend_buffer_type wsp_ggml_backend_buffer_type_metal = {
-        /* .iface = */ {
-            /* .get_name         = */ wsp_ggml_backend_metal_buffer_type_shared_get_name,
-            /* .alloc_buffer     = */ wsp_ggml_backend_metal_buffer_type_shared_alloc_buffer,
-            /* .get_alignment    = */ wsp_ggml_backend_metal_buffer_type_shared_get_alignment,
-            /* .get_max_size     = */ wsp_ggml_backend_metal_buffer_type_shared_get_max_size,
-            /* .get_alloc_size   = */ wsp_ggml_backend_metal_buffer_type_shared_get_alloc_size,
-            /* .is_host          = */ wsp_ggml_backend_metal_buffer_type_shared_is_host,
-        },
-        /* .device  = */ &g_wsp_ggml_metal_device,
-        /* .context = */ NULL,
-    };
+static wsp_ggml_backend_buffer_type_t wsp_ggml_backend_metal_buffer_type_shared(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
 
-    return &wsp_ggml_backend_buffer_type_metal;
+    static std::vector<wsp_ggml_backend_buffer_type> bufts;
+    static std::vector<wsp_ggml_backend_metal_buffer_type_ptr> ctxs;
+
+    static bool initialized = false;
+    if (!initialized) {
+        bufts.reserve(g_devices);
+        ctxs.reserve(g_devices);
+
+        for (int i = 0; i < g_devices; ++i) {
+            wsp_ggml_backend_metal_buffer_type * raw_ctx =
+                new wsp_ggml_backend_metal_buffer_type {
+                    /* .device = */ i,
+                    /* .name   = */ WSP_GGML_METAL_NAME + std::to_string(i),
+                };
+            ctxs.emplace_back(raw_ctx);
+
+            wsp_ggml_backend_buffer_type buft = {
+                /* .iface = */ {
+                    /* .get_name         = */ wsp_ggml_backend_metal_buffer_type_shared_get_name,
+                    /* .alloc_buffer     = */ wsp_ggml_backend_metal_buffer_type_shared_alloc_buffer,
+                    /* .get_alignment    = */ wsp_ggml_backend_metal_buffer_type_shared_get_alignment,
+                    /* .get_max_size     = */ wsp_ggml_backend_metal_buffer_type_shared_get_max_size,
+                    /* .get_alloc_size   = */ wsp_ggml_backend_metal_buffer_type_shared_get_alloc_size,
+                    /* .is_host          = */ wsp_ggml_backend_metal_buffer_type_shared_is_host,
+                },
+                /* .device  = */ wsp_ggml_backend_reg_dev_get(wsp_ggml_backend_metal_reg(), i),
+                /* .context = */ raw_ctx,
+            };
+
+            bufts.emplace_back(buft);
+        }
+
+        initialized = true;
+    }
+
+    return &bufts[device];
 }
 
 // default (private) buffer type
 
 static const char * wsp_ggml_backend_metal_buffer_type_private_get_name(wsp_ggml_backend_buffer_type_t buft) {
-    return "Metal_Private";
+    wsp_ggml_backend_metal_buffer_type * ctx = (wsp_ggml_backend_metal_buffer_type *)buft->context;
 
-    WSP_GGML_UNUSED(buft);
+    return ctx->name.c_str();
 }
 
 static wsp_ggml_backend_buffer_t wsp_ggml_backend_metal_buffer_type_private_alloc_buffer(wsp_ggml_backend_buffer_type_t buft, size_t size) {
@@ -300,29 +347,53 @@ static bool wsp_ggml_backend_metal_buffer_type_private_is_host(wsp_ggml_backend_
     WSP_GGML_UNUSED(buft);
 }
 
-static wsp_ggml_backend_buffer_type_t wsp_ggml_backend_metal_buffer_type_private(void) {
-    static wsp_ggml_backend_buffer_type wsp_ggml_backend_buffer_type_metal = {
-        /* .iface = */ {
-            /* .get_name         = */ wsp_ggml_backend_metal_buffer_type_private_get_name,
-            /* .alloc_buffer     = */ wsp_ggml_backend_metal_buffer_type_private_alloc_buffer,
-            /* .get_alignment    = */ wsp_ggml_backend_metal_buffer_type_private_get_alignment,
-            /* .get_max_size     = */ wsp_ggml_backend_metal_buffer_type_private_get_max_size,
-            /* .get_alloc_size   = */ wsp_ggml_backend_metal_buffer_type_private_get_alloc_size,
-            /* .is_host          = */ wsp_ggml_backend_metal_buffer_type_private_is_host,
-        },
-        /* .device  = */ &g_wsp_ggml_metal_device,
-        /* .context = */ NULL,
-    };
+static wsp_ggml_backend_buffer_type_t wsp_ggml_backend_metal_buffer_type_private(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
 
-    return &wsp_ggml_backend_buffer_type_metal;
+    static std::vector<wsp_ggml_backend_buffer_type> bufts;
+    static std::vector<wsp_ggml_backend_metal_buffer_type_ptr> ctxs;
+
+    static bool initialized = false;
+    if (!initialized) {
+        bufts.reserve(g_devices);
+        ctxs.reserve(g_devices);
+
+        for (int i = 0; i < g_devices; ++i) {
+            wsp_ggml_backend_metal_buffer_type * raw_ctx = new wsp_ggml_backend_metal_buffer_type{
+                /* .device = */ i,
+                /* .name   = */ WSP_GGML_METAL_NAME + std::to_string(i) + "_Private"
+            };
+            ctxs.emplace_back(raw_ctx);
+
+            wsp_ggml_backend_buffer_type buft = {
+                /* .iface = */ {
+                    /* .get_name         = */ wsp_ggml_backend_metal_buffer_type_private_get_name,
+                    /* .alloc_buffer     = */ wsp_ggml_backend_metal_buffer_type_private_alloc_buffer,
+                    /* .get_alignment    = */ wsp_ggml_backend_metal_buffer_type_private_get_alignment,
+                    /* .get_max_size     = */ wsp_ggml_backend_metal_buffer_type_private_get_max_size,
+                    /* .get_alloc_size   = */ wsp_ggml_backend_metal_buffer_type_private_get_alloc_size,
+                    /* .is_host          = */ wsp_ggml_backend_metal_buffer_type_private_is_host,
+                },
+                /* .device  = */ wsp_ggml_backend_reg_dev_get(wsp_ggml_backend_metal_reg(), i),
+                /* .context = */ raw_ctx,
+            };
+
+            bufts.emplace_back(buft);
+        }
+
+        initialized = true;
+    }
+
+    return &bufts[device];
 }
 
 // mapped buffer type
 
 static const char * wsp_ggml_backend_metal_buffer_type_mapped_get_name(wsp_ggml_backend_buffer_type_t buft) {
-    return "Metal_Mapped";
+    wsp_ggml_backend_metal_buffer_type * ctx = (wsp_ggml_backend_metal_buffer_type *)buft->context;
 
-    WSP_GGML_UNUSED(buft);
+    return ctx->name.c_str();
 }
 
 static wsp_ggml_backend_buffer_t wsp_ggml_backend_metal_buffer_type_mapped_alloc_buffer(wsp_ggml_backend_buffer_type_t buft, size_t size) {
@@ -352,31 +423,55 @@ static bool wsp_ggml_backend_metal_buffer_type_mapped_is_host(wsp_ggml_backend_b
     WSP_GGML_UNUSED(buft);
 }
 
-static wsp_ggml_backend_buffer_type_t wsp_ggml_backend_metal_buffer_type_mapped(void) {
-    // note: not obvious, but this buffer type still needs to implement .alloc_buffer:
-    //       https://github.com/ggml-org/llama.cpp/pull/15832#discussion_r2333177099
-    static wsp_ggml_backend_buffer_type wsp_ggml_backend_buffer_type_mapped_metal = {
-        /* .iface = */ {
-            /* .get_name         = */ wsp_ggml_backend_metal_buffer_type_mapped_get_name,
-            /* .alloc_buffer     = */ wsp_ggml_backend_metal_buffer_type_mapped_alloc_buffer,
-            /* .get_alignment    = */ wsp_ggml_backend_metal_buffer_type_mapped_get_alignment,
-            /* .get_max_size     = */ wsp_ggml_backend_metal_buffer_type_mapped_get_max_size,
-            /* .get_alloc_size   = */ wsp_ggml_backend_metal_buffer_type_mapped_get_alloc_size,
-            /* .is_host          = */ wsp_ggml_backend_metal_buffer_type_mapped_is_host,
-        },
-        /* .device  = */ &g_wsp_ggml_metal_device,
-        /* .context = */ NULL,
-    };
+static wsp_ggml_backend_buffer_type_t wsp_ggml_backend_metal_buffer_type_mapped(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
 
-    return &wsp_ggml_backend_buffer_type_mapped_metal;
+    static std::vector<wsp_ggml_backend_buffer_type> bufts;
+    static std::vector<wsp_ggml_backend_metal_buffer_type_ptr> ctxs;
+
+    static bool initialized = false;
+    if (!initialized) {
+        bufts.reserve(g_devices);
+        ctxs.reserve(g_devices);
+
+        for (int i = 0; i < g_devices; ++i) {
+            wsp_ggml_backend_metal_buffer_type * raw_ctx = new wsp_ggml_backend_metal_buffer_type{
+                /* .device = */ i,
+                /* .name   = */ WSP_GGML_METAL_NAME + std::to_string(i) + "_Mapped"
+            };
+            ctxs.emplace_back(raw_ctx);
+
+            // note: not obvious, but this buffer type still needs to implement .alloc_buffer:
+            //       https://github.com/ggml-org/llama.cpp/pull/15832#discussion_r2333177099
+            wsp_ggml_backend_buffer_type buft = {
+                /* .iface = */ {
+                    /* .get_name         = */ wsp_ggml_backend_metal_buffer_type_mapped_get_name,
+                    /* .alloc_buffer     = */ wsp_ggml_backend_metal_buffer_type_mapped_alloc_buffer,
+                    /* .get_alignment    = */ wsp_ggml_backend_metal_buffer_type_mapped_get_alignment,
+                    /* .get_max_size     = */ wsp_ggml_backend_metal_buffer_type_mapped_get_max_size,
+                    /* .get_alloc_size   = */ wsp_ggml_backend_metal_buffer_type_mapped_get_alloc_size,
+                    /* .is_host          = */ wsp_ggml_backend_metal_buffer_type_mapped_is_host,
+                },
+                /* .device  = */ wsp_ggml_backend_reg_dev_get(wsp_ggml_backend_metal_reg(), i),
+                /* .context = */ raw_ctx,
+            };
+
+            bufts.emplace_back(buft);
+        }
+
+        initialized = true;
+    }
+
+    return &bufts[device];
 }
 
 // backend
 
 static const char * wsp_ggml_backend_metal_name(wsp_ggml_backend_t backend) {
-    return "Metal";
+    wsp_ggml_metal_t ctx = (wsp_ggml_metal_t)backend->context;
 
-    WSP_GGML_UNUSED(backend);
+    return wsp_ggml_metal_get_name(ctx);
 }
 
 static void wsp_ggml_backend_metal_free(wsp_ggml_backend_t backend) {
@@ -409,18 +504,44 @@ static void wsp_ggml_backend_metal_get_tensor_async(wsp_ggml_backend_t backend, 
 }
 
 static bool wsp_ggml_backend_metal_cpy_tensor_async(wsp_ggml_backend_t backend_src, wsp_ggml_backend_t backend_dst, const wsp_ggml_tensor * src, wsp_ggml_tensor * dst) {
-    return false;
+    if (!wsp_ggml_backend_is_metal(backend_src) || !wsp_ggml_backend_is_metal(backend_dst)) {
+        return false;
+    }
 
-    WSP_GGML_UNUSED(backend_src);
-    WSP_GGML_UNUSED(backend_dst);
-    WSP_GGML_UNUSED(src);
-    WSP_GGML_UNUSED(dst);
+    if (!wsp_ggml_backend_buffer_is_metal(src->buffer) || !wsp_ggml_backend_buffer_is_metal(dst->buffer)) {
+        return false;
+    }
+
+    wsp_ggml_metal_t ctx_src = (wsp_ggml_metal_t)backend_src->context;
+    wsp_ggml_metal_t ctx_dst = (wsp_ggml_metal_t)backend_dst->context;
+
+    //wsp_ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+    //wsp_ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+
+    //wsp_ggml_metal_buffer_t buf_ctx_src = (wsp_ggml_metal_buffer_t)buf_src->context;
+    //wsp_ggml_metal_buffer_t buf_ctx_dst = (wsp_ggml_metal_buffer_t)buf_dst->context;
+
+    return wsp_ggml_metal_cpy_tensor_async(ctx_src, ctx_dst, src, dst);
 }
 
 static enum wsp_ggml_status wsp_ggml_backend_metal_graph_compute(wsp_ggml_backend_t backend, wsp_ggml_cgraph * cgraph) {
     wsp_ggml_metal_t ctx = (wsp_ggml_metal_t)backend->context;
 
     return wsp_ggml_metal_graph_compute(ctx, cgraph);
+}
+
+static void wsp_ggml_backend_metal_event_record(wsp_ggml_backend_t backend, wsp_ggml_backend_event_t event) {
+    wsp_ggml_metal_t ctx = (wsp_ggml_metal_t)backend->context;
+    wsp_ggml_metal_event_t ev = (wsp_ggml_metal_event_t)event->context;
+
+    wsp_ggml_metal_event_record(ctx, ev);
+}
+
+static void wsp_ggml_backend_metal_event_wait(wsp_ggml_backend_t backend, wsp_ggml_backend_event_t event) {
+    wsp_ggml_metal_t ctx = (wsp_ggml_metal_t)backend->context;
+    wsp_ggml_metal_event_t ev = (wsp_ggml_metal_event_t)event->context;
+
+    wsp_ggml_metal_event_wait(ctx, ev);
 }
 
 static void wsp_ggml_backend_metal_graph_optimize(wsp_ggml_backend_t backend, wsp_ggml_cgraph * cgraph) {
@@ -435,7 +556,6 @@ static void wsp_ggml_backend_metal_set_n_cb(wsp_ggml_backend_t backend, int n_cb
     wsp_ggml_metal_t ctx = (wsp_ggml_metal_t)backend->context;
 
     wsp_ggml_metal_set_n_cb(ctx, n_cb);
-
 }
 
 static wsp_ggml_backend_i wsp_ggml_backend_metal_i = {
@@ -450,12 +570,8 @@ static wsp_ggml_backend_i wsp_ggml_backend_metal_i = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ wsp_ggml_backend_metal_graph_compute,
-
-    // the events API is needed only for multi-GPU setups, so likely no need to implement it for Metal
-    // in any case, these docs seem relevant if we ever decide to implement it:
-    // https://developer.apple.com/documentation/metal/mtlcommandbuffer#Synchronizing-Passes-with-Events
-    /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL,
+    /* .event_record            = */ wsp_ggml_backend_metal_event_record,
+    /* .event_wait              = */ wsp_ggml_backend_metal_event_wait,
     /* .graph_optimize          = */ wsp_ggml_backend_metal_graph_optimize,
 };
 
@@ -519,15 +635,17 @@ void wsp_ggml_backend_metal_capture_next_compute(wsp_ggml_backend_t backend) {
 // backend device
 
 static const char * wsp_ggml_backend_metal_device_get_name(wsp_ggml_backend_dev_t dev) {
-    return "Metal";
+    wsp_ggml_metal_device_t ctx_dev = (wsp_ggml_metal_device_t)dev->context;
 
-    WSP_GGML_UNUSED(dev);
+    const wsp_ggml_metal_device_props * props_dev = wsp_ggml_metal_device_get_props(ctx_dev);
+
+    return props_dev->name;
 }
 
 static const char * wsp_ggml_backend_metal_device_get_description(wsp_ggml_backend_dev_t dev) {
     wsp_ggml_metal_device_t ctx_dev = (wsp_ggml_metal_device_t)dev->context;
 
-    return wsp_ggml_metal_device_get_props(ctx_dev)->name;
+    return wsp_ggml_metal_device_get_props(ctx_dev)->desc;
 }
 
 static void wsp_ggml_backend_metal_device_get_memory(wsp_ggml_backend_dev_t dev, size_t * free, size_t * total) {
@@ -550,14 +668,14 @@ static void wsp_ggml_backend_metal_device_get_props(wsp_ggml_backend_dev_t dev, 
     wsp_ggml_backend_metal_device_get_memory(dev, &props->memory_free, &props->memory_total);
 
     props->caps = {
-        /* .async                 = */ true,
-        /* .host_buffer           = */ false,
-        /* .buffer_from_host_ptr  = */ true,
-        /* .events                = */ false,
+        /* .async                = */ true,
+        /* .host_buffer          = */ false,
+        /* .buffer_from_host_ptr = */ true,
+        /* .events               = */ true,
     };
 }
 
-static wsp_ggml_backend_t wsp_ggml_backend_metal_device_init(wsp_ggml_backend_dev_t dev, const char * params) {
+static wsp_ggml_backend_t wsp_ggml_backend_metal_device_init_backend(wsp_ggml_backend_dev_t dev, const char * params) {
     wsp_ggml_metal_device_t ctx_dev = (wsp_ggml_metal_device_t)dev->context;
 
     wsp_ggml_metal_t ctx = wsp_ggml_metal_init(ctx_dev);
@@ -587,7 +705,7 @@ static wsp_ggml_backend_buffer_type_t wsp_ggml_backend_metal_device_get_buffer_t
 
     const wsp_ggml_metal_device_props * props_dev = wsp_ggml_metal_device_get_props(ctx_dev);
 
-    return props_dev->use_shared_buffers ? wsp_ggml_backend_metal_buffer_type_shared() : wsp_ggml_backend_metal_buffer_type_private();
+    return props_dev->use_shared_buffers ? wsp_ggml_backend_metal_buffer_type_shared(props_dev->device) : wsp_ggml_backend_metal_buffer_type_private(props_dev->device);
 }
 
 static wsp_ggml_backend_buffer_t wsp_ggml_backend_metal_device_buffer_mapped(wsp_ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
@@ -595,7 +713,9 @@ static wsp_ggml_backend_buffer_t wsp_ggml_backend_metal_device_buffer_mapped(wsp
 
     wsp_ggml_metal_buffer_t res = wsp_ggml_metal_buffer_map(ctx_dev, ptr, size, max_tensor_size);
 
-    return wsp_ggml_backend_buffer_init(wsp_ggml_backend_metal_buffer_type_mapped(), wsp_ggml_backend_metal_buffer_shared_i, res, size);
+    const wsp_ggml_metal_device_props * props_dev = wsp_ggml_metal_device_get_props(ctx_dev);
+
+    return wsp_ggml_backend_buffer_init(wsp_ggml_backend_metal_buffer_type_mapped(props_dev->device), wsp_ggml_backend_metal_buffer_shared_i, res, size);
 }
 
 static bool wsp_ggml_backend_metal_device_supports_op(wsp_ggml_backend_dev_t dev, const wsp_ggml_tensor * op) {
@@ -606,9 +726,10 @@ static bool wsp_ggml_backend_metal_device_supports_op(wsp_ggml_backend_dev_t dev
 
 static bool wsp_ggml_backend_metal_device_supports_buft(wsp_ggml_backend_dev_t dev, wsp_ggml_backend_buffer_type_t buft) {
     return
+        buft->device == dev && (
         buft->iface.get_name == wsp_ggml_backend_metal_buffer_type_shared_get_name ||
         buft->iface.get_name == wsp_ggml_backend_metal_buffer_type_private_get_name ||
-        buft->iface.get_name == wsp_ggml_backend_metal_buffer_type_mapped_get_name;
+        buft->iface.get_name == wsp_ggml_backend_metal_buffer_type_mapped_get_name);
 
     WSP_GGML_UNUSED(dev);
 }
@@ -632,45 +753,97 @@ static bool wsp_ggml_backend_metal_device_offload_op(wsp_ggml_backend_dev_t dev,
             get_op_batch_size(op) >= wsp_ggml_metal_device_get_props(ctx_dev)->op_offload_min_batch_size;
 }
 
+static wsp_ggml_backend_event_t wsp_ggml_backend_metal_device_event_new(wsp_ggml_backend_dev_t dev) {
+    wsp_ggml_metal_device_t ctx_dev = (wsp_ggml_metal_device_t)dev->context;
+
+    wsp_ggml_metal_event_t event = wsp_ggml_metal_device_event_init(ctx_dev);
+    WSP_GGML_ASSERT(event);
+
+    wsp_ggml_backend_event_t ev = new wsp_ggml_backend_event {
+        /* .device  = */ dev,
+        /* .context = */ event,
+    };
+
+    return ev;
+}
+
+static void wsp_ggml_backend_metal_device_event_free(wsp_ggml_backend_dev_t dev, wsp_ggml_backend_event_t event) {
+    wsp_ggml_metal_device_t ctx_dev = (wsp_ggml_metal_device_t)dev->context;
+
+    wsp_ggml_metal_event_t ev = (wsp_ggml_metal_event_t)event->context;
+
+    wsp_ggml_metal_device_event_free(ctx_dev, ev);
+
+    delete event;
+}
+
+static void wsp_ggml_backend_metal_device_event_synchronize(wsp_ggml_backend_dev_t dev, wsp_ggml_backend_event_t event) {
+    wsp_ggml_metal_device_t ctx_dev = (wsp_ggml_metal_device_t)dev->context;
+
+    wsp_ggml_metal_event_t evt = (wsp_ggml_metal_event_t)event->context;
+
+    wsp_ggml_metal_device_event_synchronize(ctx_dev, evt);
+}
+
 static wsp_ggml_backend_device_i wsp_ggml_backend_metal_device_i = {
     /* .get_name             = */ wsp_ggml_backend_metal_device_get_name,
     /* .get_description      = */ wsp_ggml_backend_metal_device_get_description,
     /* .get_memory           = */ wsp_ggml_backend_metal_device_get_memory,
     /* .get_type             = */ wsp_ggml_backend_metal_device_get_type,
     /* .get_props            = */ wsp_ggml_backend_metal_device_get_props,
-    /* .init_backend         = */ wsp_ggml_backend_metal_device_init,
+    /* .init_backend         = */ wsp_ggml_backend_metal_device_init_backend,
     /* .get_buffer_type      = */ wsp_ggml_backend_metal_device_get_buffer_type,
     /* .get_host_buffer_type = */ NULL,
     /* .buffer_from_host_ptr = */ wsp_ggml_backend_metal_device_buffer_mapped,
     /* .supports_op          = */ wsp_ggml_backend_metal_device_supports_op,
     /* .supports_buft        = */ wsp_ggml_backend_metal_device_supports_buft,
     /* .offload_op           = */ wsp_ggml_backend_metal_device_offload_op,
-    /* .event_new            = */ NULL,
-    /* .event_free           = */ NULL,
-    /* .event_synchronize    = */ NULL,
+    /* .event_new            = */ wsp_ggml_backend_metal_device_event_new,
+    /* .event_free           = */ wsp_ggml_backend_metal_device_event_free,
+    /* .event_synchronize    = */ wsp_ggml_backend_metal_device_event_synchronize,
 };
 
 // backend registry
 
+struct wsp_ggml_backend_metal_reg {
+    std::vector<wsp_ggml_backend_dev_t> devices;
+};
+
+typedef struct wsp_ggml_backend_metal_reg * wsp_ggml_backend_metal_reg_t;
+
+static wsp_ggml_backend_metal_reg_t wsp_ggml_backend_metal_reg_init(void) {
+    wsp_ggml_backend_metal_reg_t ctx = new struct wsp_ggml_backend_metal_reg;
+
+    return ctx;
+}
+
+static void wsp_ggml_backend_metal_reg_free(wsp_ggml_backend_metal_reg_t ctx) {
+    delete ctx;
+}
+
+struct wsp_ggml_backend_metal_reg_deleter {
+    void operator()(wsp_ggml_backend_metal_reg_t ctx) {
+        wsp_ggml_backend_metal_reg_free(ctx);
+    }
+};
+
+typedef std::unique_ptr<struct wsp_ggml_backend_metal_reg, wsp_ggml_backend_metal_reg_deleter> wsp_ggml_backend_metal_reg_ptr;
+
 static const char * wsp_ggml_backend_metal_reg_get_name(wsp_ggml_backend_reg_t reg) {
-    return "Metal";
+    return WSP_GGML_METAL_NAME;
 
     WSP_GGML_UNUSED(reg);
 }
 
 static size_t wsp_ggml_backend_metal_reg_device_count(wsp_ggml_backend_reg_t reg) {
-    return 1;
-
-    WSP_GGML_UNUSED(reg);
+    wsp_ggml_backend_metal_reg_t ctx = (wsp_ggml_backend_metal_reg_t)reg->context;
+    return ctx->devices.size();
 }
 
 static wsp_ggml_backend_dev_t wsp_ggml_backend_metal_reg_device_get(wsp_ggml_backend_reg_t reg, size_t index) {
-    WSP_GGML_ASSERT(index == 0);
-
-    return &g_wsp_ggml_metal_device;
-
-    WSP_GGML_UNUSED(reg);
-    WSP_GGML_UNUSED(index);
+    wsp_ggml_backend_metal_reg_t ctx = (wsp_ggml_backend_metal_reg_t)reg->context;
+    WSP_GGML_ASSERT(index < ctx->devices.size());
+    return ctx->devices[index];
 }
 
 static wsp_ggml_backend_feature g_wsp_ggml_backend_metal_features[] = {
@@ -698,27 +871,67 @@ static void * wsp_ggml_backend_metal_get_proc_address(wsp_ggml_backend_reg_t reg
 
 static wsp_ggml_backend_reg_i wsp_ggml_backend_metal_reg_i = {
     /* .get_name         = */ wsp_ggml_backend_metal_reg_get_name,
-    /* .device_count     = */ wsp_ggml_backend_metal_reg_device_count,
-    /* .device_get       = */ wsp_ggml_backend_metal_reg_device_get,
+    /* .get_device_count = */ wsp_ggml_backend_metal_reg_device_count,
+    /* .get_device       = */ wsp_ggml_backend_metal_reg_device_get,
     /* .get_proc_address = */ wsp_ggml_backend_metal_get_proc_address,
 };
 
-wsp_ggml_backend_reg_t wsp_ggml_backend_metal_reg(void) {
-    {
-        g_wsp_ggml_metal_reg = {
-            /* .api_version = */ WSP_GGML_BACKEND_API_VERSION,
-            /* .iface       = */ wsp_ggml_backend_metal_reg_i,
-            /* .context     = */ NULL,
-        };
+static wsp_ggml_backend_dev_t wsp_ggml_backend_metal_device_init(wsp_ggml_backend_reg_t reg, int device) {
+    return new wsp_ggml_backend_device {
+        /* .iface   = */ wsp_ggml_backend_metal_device_i,
+        /* .reg     = */ reg,
+        /* .context = */ wsp_ggml_metal_device_get(device),
+    };
+}
 
-        g_wsp_ggml_metal_device = {
-            /* .iface   = */ wsp_ggml_backend_metal_device_i,
-            /* .reg     = */ &g_wsp_ggml_metal_reg,
-            /* .context = */ wsp_ggml_metal_device_get(),
-        };
+static void wsp_ggml_backend_metal_device_free(wsp_ggml_backend_dev_t dev) {
+    delete dev;
+}
+
+struct wsp_ggml_backend_device_deleter {
+    void operator()(wsp_ggml_backend_dev_t ctx) {
+        wsp_ggml_backend_metal_device_free(ctx);
+    }
+};
+
+typedef std::unique_ptr<wsp_ggml_backend_device, wsp_ggml_backend_device_deleter> wsp_ggml_backend_device_ptr;
+
+wsp_ggml_backend_reg_t wsp_ggml_backend_metal_reg(void) {
+    static wsp_ggml_backend_reg reg;
+    static bool initialized = false;
+
+    {
+        static std::mutex mutex;
+        std::lock_guard<std::mutex> lock(mutex);
+
+        const char * env = getenv("WSP_GGML_METAL_DEVICES");
+        if (env) {
+            g_devices = atoi(env);
+        }
+
+        static std::vector<wsp_ggml_backend_device_ptr> devs;
+
+        if (!initialized) {
+            static wsp_ggml_backend_metal_reg_ptr reg_ctx(wsp_ggml_backend_metal_reg_init());
+
+            for (int i = 0; i < g_devices; ++i) {
+                auto * dev = wsp_ggml_backend_metal_device_init(&reg, i);
+                devs.emplace_back(dev);
+
+                reg_ctx->devices.push_back(dev);
+            }
+
+            reg = {
+                /* .api_version = */ WSP_GGML_BACKEND_API_VERSION,
+                /* .iface       = */ wsp_ggml_backend_metal_reg_i,
+                /* .context     = */ reg_ctx.get(),
+            };
+        }
+
+        initialized = true;
     }
 
-    return &g_wsp_ggml_metal_reg;
+    return &reg;
 }
 
 WSP_GGML_BACKEND_DL_IMPL(wsp_ggml_backend_metal_reg)

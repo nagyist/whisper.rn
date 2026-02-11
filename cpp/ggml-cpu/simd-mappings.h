@@ -116,6 +116,17 @@ extern "C" {
 // defined in ggml-cpu.c, initialized in wsp_ggml_cpu_init()
 extern float wsp_ggml_table_f32_f16[1 << 16];
 
+// precomputed f32 table for e8m0 half (1 KB)
+// defined in ggml-cpu.c, initialized in wsp_ggml_cpu_init()
+extern float wsp_ggml_table_f32_e8m0_half[1 << 8];
+
+// Use lookup table for E8M0 on x86 (faster than bit manipulation)
+#if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__)
+#define WSP_GGML_CPU_E8M0_TO_FP32_HALF(x) wsp_ggml_table_f32_e8m0_half[(uint8_t)(x)]
+#else
+#define WSP_GGML_CPU_E8M0_TO_FP32_HALF(x) WSP_GGML_E8M0_TO_FP32_HALF(x)
+#endif
+
 // On ARM NEON, it's quicker to directly convert x -> x instead of calling into wsp_ggml_lookup_fp16_to_fp32,
 // so we define WSP_GGML_CPU_FP16_TO_FP32 and WSP_GGML_CPU_FP32_TO_FP16 elsewhere for NEON.
 // This is also true for POWER9.
@@ -654,6 +665,14 @@ static inline void __avx_f32cx8_store(wsp_ggml_fp16_t *x, __m256 y) {
           vec_extract(x[0], 2) +               \
           vec_extract(x[0], 3);                \
 }
+#define WSP_GGML_F32x4_REDUCE_4(res, s0, s1, s2, s3)        \
+{                                                       \
+    vector float v = vec_add(vec_add(s0, s1),           \
+                             vec_add(s2, s3));          \
+    v = vec_add(v, vec_sld(v, v, 8));                   \
+    v = vec_add(v, vec_sld(v, v, 4));                   \
+    res += (wsp_ggml_float) vec_extract(v, 0);              \
+}
 
 #define WSP_GGML_F32_VEC        WSP_GGML_F32x4
 #define WSP_GGML_F32_VEC_ZERO   WSP_GGML_F32x4_ZERO
@@ -689,6 +708,29 @@ static inline unsigned char wsp_ggml_endian_byte(int i) {
     vec_xst(vec_pack_to_short_fp32(r[i - WSP_GGML_ENDIAN_BYTE(1)],  \
                                    r[i - WSP_GGML_ENDIAN_BYTE(0)]), \
             0, p - WSP_GGML_F16_EPR)
+
+//BF16 POWER9
+#define WSP_GGML_BF16_STEP 16
+#define WSP_GGML_BF16_EPR  8
+
+#define WSP_GGML_BF16x8         vector unsigned short
+#define WSP_GGML_BF16x8_ZERO    vec_splats((unsigned short)0)
+#define WSP_GGML_BF16x8_LOAD(p) vec_xl(0, (const unsigned short *)(p))
+
+#define WSP_GGML_BF16_VEC          WSP_GGML_BF16x8
+#define WSP_GGML_BF16_VEC_ZERO     WSP_GGML_BF16x8_ZERO
+#define WSP_GGML_BF16_VEC_LOAD     WSP_GGML_BF16x8_LOAD
+#if defined(__LITTLE_ENDIAN__)
+#define WSP_GGML_BF16_TO_F32_LO(v) ((vector float) vec_mergel(WSP_GGML_BF16_VEC_ZERO, (v)))
+#define WSP_GGML_BF16_TO_F32_HI(v) ((vector float) vec_mergeh(WSP_GGML_BF16_VEC_ZERO, (v)))
+#else
+#define WSP_GGML_BF16_TO_F32_LO(v) ((vector float) vec_mergel((v), WSP_GGML_BF16_VEC_ZERO))
+#define WSP_GGML_BF16_TO_F32_HI(v) ((vector float) vec_mergeh((v), WSP_GGML_BF16_VEC_ZERO))
+#endif
+#define WSP_GGML_BF16_FMA_LO(acc, x, y) \
+    (acc) = WSP_GGML_F32x4_FMA((acc), WSP_GGML_BF16_TO_F32_LO(x), WSP_GGML_BF16_TO_F32_LO(y))
+#define WSP_GGML_BF16_FMA_HI(acc, x, y) \
+    (acc) = WSP_GGML_F32x4_FMA((acc), WSP_GGML_BF16_TO_F32_HI(x), WSP_GGML_BF16_TO_F32_HI(y))
 
 #elif defined(__wasm_simd128__)
 

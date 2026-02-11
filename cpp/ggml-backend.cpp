@@ -258,6 +258,7 @@ void wsp_ggml_backend_tensor_set_async(wsp_ggml_backend_t backend, struct wsp_gg
     WSP_GGML_ASSERT(offset + size <= wsp_ggml_nbytes(tensor) && "tensor write out of bounds");
 
     if (backend->iface.set_tensor_async == NULL) {
+        wsp_ggml_backend_synchronize(backend);
         wsp_ggml_backend_tensor_set(tensor, data, offset, size);
     } else {
         backend->iface.set_tensor_async(backend, tensor, data, offset, size);
@@ -271,6 +272,7 @@ void wsp_ggml_backend_tensor_get_async(wsp_ggml_backend_t backend, const struct 
     WSP_GGML_ASSERT(offset + size <= wsp_ggml_nbytes(tensor) && "tensor read out of bounds");
 
     if (backend->iface.get_tensor_async == NULL) {
+        wsp_ggml_backend_synchronize(backend);
         wsp_ggml_backend_tensor_get(tensor, data, offset, size);
     } else {
         backend->iface.get_tensor_async(backend, tensor, data, offset, size);
@@ -874,9 +876,9 @@ static void wsp_ggml_backend_sched_print_assignments(wsp_ggml_backend_sched_t sc
         }
         if (sched->debug > 1) {
             wsp_ggml_backend_t tensor_backend = wsp_ggml_backend_sched_get_tensor_backend(sched, node);
-            WSP_GGML_LOG_DEBUG("node #%3d (%10.10s): %20.20s (%5.5s) [%5.5s %8.8s] use=%d:", i, wsp_ggml_op_name(node->op), node->name,
+            WSP_GGML_LOG_DEBUG("node #%3d (%10.10s): %20.20s (%5.5s) [%5.5s %8.8s] use=%d,c=%d:", i, wsp_ggml_op_name(node->op), node->name,
                 fmt_size(wsp_ggml_nbytes(node)), tensor_backend ? wsp_ggml_backend_name(tensor_backend) : "NULL", GET_CAUSE(node),
-                graph->use_counts[wsp_ggml_hash_find(&graph->visited_hash_set, node)]);
+                graph->use_counts[wsp_ggml_hash_find(&graph->visited_hash_set, node)], node->flags & WSP_GGML_TENSOR_FLAG_COMPUTE ? 1 : 0);
             for (int j = 0; j < WSP_GGML_MAX_SRC; j++) {
                 struct wsp_ggml_tensor * src = node->src[j];
                 if (src == NULL) {
@@ -1922,6 +1924,7 @@ static struct wsp_ggml_tensor * graph_copy_dup_tensor(struct wsp_ggml_hash_set h
         dst->view_offs = src->view_offs;
     }
     dst->op = src->op;
+    dst->flags = src->flags;
     memcpy(dst->op_params, src->op_params, sizeof(dst->op_params));
     wsp_ggml_set_name(dst, src->name);
 

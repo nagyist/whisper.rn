@@ -71,6 +71,8 @@ cp ./whisper.cpp/ggml/src/ggml.c ./cpp/ggml.c
 cp ./whisper.cpp/ggml/src/ggml-impl.h ./cpp/ggml-impl.h
 cp ./whisper.cpp/ggml/src/ggml-alloc.c ./cpp/ggml-alloc.c
 cp ./whisper.cpp/ggml/src/ggml-backend.cpp ./cpp/ggml-backend.cpp
+cp ./whisper.cpp/ggml/src/ggml-backend-dl.h ./cpp/ggml-backend-dl.h
+cp ./whisper.cpp/ggml/src/ggml-backend-dl.cpp ./cpp/ggml-backend-dl.cpp
 cp ./whisper.cpp/ggml/src/ggml-backend-impl.h ./cpp/ggml-backend-impl.h
 cp ./whisper.cpp/ggml/src/ggml-backend-reg.cpp ./cpp/ggml-backend-reg.cpp
 cp ./whisper.cpp/ggml/src/ggml-common.h ./cpp/ggml-common.h
@@ -120,6 +122,7 @@ files=(
   "./cpp/ggml-alloc.c"
   "./cpp/ggml-backend.h"
   "./cpp/ggml-backend.cpp"
+  "./cpp/ggml-backend-dl.cpp"
   "./cpp/ggml-backend-impl.h"
   "./cpp/ggml-backend-reg.cpp"
   "./cpp/ggml-cpu.h"

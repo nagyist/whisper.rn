@@ -105,6 +105,8 @@ struct wsp_ggml_backend_cpu_context {
 
     wsp_ggml_abort_callback abort_callback;
     void *              abort_callback_data;
+
+    bool                use_ref;  // use reference implementation
 };
 
 static const char * wsp_ggml_backend_cpu_get_name(wsp_ggml_backend_t backend) {
@@ -143,6 +145,7 @@ static wsp_ggml_backend_graph_plan_t wsp_ggml_backend_cpu_graph_plan_create(wsp_
 
     cpu_plan->cplan.abort_callback      = cpu_ctx->abort_callback;
     cpu_plan->cplan.abort_callback_data = cpu_ctx->abort_callback_data;
+    cpu_plan->cplan.use_ref             = cpu_ctx->use_ref;
 
     return cpu_plan;
 }
@@ -182,6 +185,7 @@ static enum wsp_ggml_status wsp_ggml_backend_cpu_graph_compute(wsp_ggml_backend_
 
     cplan.abort_callback      = cpu_ctx->abort_callback;
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
+    cplan.use_ref             = cpu_ctx->use_ref;
 
     return wsp_ggml_graph_compute(cgraph, &cplan);
 }
@@ -223,6 +227,7 @@ wsp_ggml_backend_t wsp_ggml_backend_cpu_init(void) {
     ctx->work_size           = 0;
     ctx->abort_callback      = NULL;
     ctx->abort_callback_data = NULL;
+    ctx->use_ref             = false;
 
     wsp_ggml_backend_t cpu_backend = new wsp_ggml_backend {
         /* .guid    = */ wsp_ggml_backend_cpu_guid(),
@@ -268,6 +273,13 @@ void wsp_ggml_backend_cpu_set_abort_callback(wsp_ggml_backend_t backend_cpu, wsp
     struct wsp_ggml_backend_cpu_context * ctx = (struct wsp_ggml_backend_cpu_context *)backend_cpu->context;
     ctx->abort_callback = abort_callback;
     ctx->abort_callback_data = abort_callback_data;
+}
+
+void wsp_ggml_backend_cpu_set_use_ref(wsp_ggml_backend_t backend_cpu, bool use_ref) {
+    WSP_GGML_ASSERT(wsp_ggml_backend_is_cpu(backend_cpu));
+
+    struct wsp_ggml_backend_cpu_context * ctx = (struct wsp_ggml_backend_cpu_context *)backend_cpu->context;
+    ctx->use_ref = use_ref;
 }
 
 // CPU backend - device
@@ -645,6 +657,9 @@ static void * wsp_ggml_backend_cpu_get_proc_address(wsp_ggml_backend_reg_t reg, 
     }
     if (strcmp(name, "wsp_ggml_backend_cpu_is_numa") == 0) {
         return (void *)wsp_ggml_is_numa;
+    }
+    if (strcmp(name, "wsp_ggml_backend_cpu_set_use_ref") == 0) {
+        return (void *)wsp_ggml_backend_cpu_set_use_ref;
     }
 
     // threadpool - TODO:  move to ggml-base

@@ -3449,7 +3449,8 @@ struct wsp_ggml_tensor * wsp_ggml_cast(
 
     result->op     = WSP_GGML_OP_CPY;
     result->src[0] = a;
-    result->src[1] = result;
+    result->src[1] = result; // note: this self-reference might seem redundant, but it's actually needed by some
+                             //       backends for consistency with wsp_ggml_cpy_impl() above
 
     return result;
 }
@@ -4846,6 +4847,8 @@ struct wsp_ggml_tensor * wsp_ggml_pool_1d(
         a->ne[2],
         a->ne[3],
     };
+    WSP_GGML_ASSERT(ne[0] > 0);
+
     struct wsp_ggml_tensor * result = wsp_ggml_new_tensor(ctx, WSP_GGML_TYPE_F32, 4, ne);
 
     int32_t params[] = { op, k0, s0, p0 };
@@ -4876,6 +4879,9 @@ struct wsp_ggml_tensor * wsp_ggml_pool_2d(
         a->ne[2],
         a->ne[3],
     };
+    WSP_GGML_ASSERT(ne[0] > 0);
+    WSP_GGML_ASSERT(ne[1] > 0);
+
     result = wsp_ggml_new_tensor(ctx, WSP_GGML_TYPE_F32, 4, ne);
 
     int32_t params[] = { op, k0, k1, s0, s1, p0, p1 };
@@ -6564,7 +6570,7 @@ static void wsp_ggml_compute_backward(
         case WSP_GGML_OP_DIAG_MASK_INF: {
             if (src0_needs_grads) {
                 /* wsp_ggml_diag_mask_inf_impl() shouldn't be here */
-                /* ref:  https://github.com/ggerganov/llama.cpp/pull/4203#discussion_r1412377992 */
+                /* ref:  https://github.com/ggml-org/llama.cpp/pull/4203#discussion_r1412377992 */
                 const int n_past = ((const int32_t *) tensor->op_params)[0];
                 wsp_ggml_add_or_set(ctx, cgraph, isrc0, wsp_ggml_diag_mask_zero_impl(ctx, grad, n_past, false));
             }
@@ -6728,19 +6734,34 @@ static void wsp_ggml_compute_backward(
     WSP_GGML_ASSERT(!src2_needs_grads || wsp_ggml_are_same_shape(src2, cgraph->grads[isrc2]));
 }
 
-static size_t wsp_ggml_visit_parents(struct wsp_ggml_cgraph * cgraph, struct wsp_ggml_tensor * node) {
-    // check if already visited
-    size_t node_hash_pos = wsp_ggml_hash_find(&cgraph->visited_hash_set, node);
+static size_t wsp_ggml_visit_parents_graph(struct wsp_ggml_cgraph * cgraph, struct wsp_ggml_tensor * node, bool compute) {
+    if (node->op != WSP_GGML_OP_NONE && compute) {
+        node->flags |= WSP_GGML_TENSOR_FLAG_COMPUTE;
+    }
+
+    const size_t node_hash_pos = wsp_ggml_hash_find(&cgraph->visited_hash_set, node);
     WSP_GGML_ASSERT(node_hash_pos != WSP_GGML_HASHSET_FULL);
-    if (!wsp_ggml_bitset_get(cgraph->visited_hash_set.used, node_hash_pos)) {
-        // This is the first time we see this node in the current graph.
-        cgraph->visited_hash_set.keys[node_hash_pos] = node;
-        wsp_ggml_bitset_set(cgraph->visited_hash_set.used, node_hash_pos);
-        cgraph->use_counts[node_hash_pos] = 0;
-    } else {
+
+    if (wsp_ggml_bitset_get(cgraph->visited_hash_set.used, node_hash_pos)) {
         // already visited
+
+        if (compute) {
+            // update the compute flag regardless
+            for (int i = 0; i < WSP_GGML_MAX_SRC; ++i) {
+                struct wsp_ggml_tensor * src = node->src[i];
+                if (src && ((src->flags & WSP_GGML_TENSOR_FLAG_COMPUTE) == 0)) {
+                    wsp_ggml_visit_parents_graph(cgraph, src, true);
+                }
+            }
+        }
+
         return node_hash_pos;
     }
+
+    // This is the first time we see this node in the current graph.
+    cgraph->visited_hash_set.keys[node_hash_pos] = node;
+    wsp_ggml_bitset_set(cgraph->visited_hash_set.used, node_hash_pos);
+    cgraph->use_counts[node_hash_pos] = 0;
 
     for (int i = 0; i < WSP_GGML_MAX_SRC; ++i) {
         const int k =
@@ -6750,7 +6771,7 @@ static size_t wsp_ggml_visit_parents(struct wsp_ggml_cgraph * cgraph, struct wsp
 
         struct wsp_ggml_tensor * src = node->src[k];
         if (src) {
-            size_t src_hash_pos = wsp_ggml_visit_parents(cgraph, src);
+            const size_t src_hash_pos = wsp_ggml_visit_parents_graph(cgraph, src, compute);
 
             // Update the use count for this operand.
             cgraph->use_counts[src_hash_pos]++;
@@ -6781,17 +6802,17 @@ static size_t wsp_ggml_visit_parents(struct wsp_ggml_cgraph * cgraph, struct wsp
     return node_hash_pos;
 }
 
-static void wsp_ggml_build_forward_impl(struct wsp_ggml_cgraph * cgraph, struct wsp_ggml_tensor * tensor, bool expand) {
+static void wsp_ggml_build_forward_impl(struct wsp_ggml_cgraph * cgraph, struct wsp_ggml_tensor * tensor, bool expand, bool compute) {
     if (!expand) {
         // TODO: this branch isn't accessible anymore, maybe move this to wsp_ggml_build_forward_expand
         wsp_ggml_graph_clear(cgraph);
     }
 
-    const int n0 = cgraph->n_nodes;
+    const int n_old = cgraph->n_nodes;
 
-    wsp_ggml_visit_parents(cgraph, tensor);
+    wsp_ggml_visit_parents_graph(cgraph, tensor, compute);
 
-    const int n_new = cgraph->n_nodes - n0;
+    const int n_new = cgraph->n_nodes - n_old;
     WSP_GGML_PRINT_DEBUG("%s: visited %d new nodes\n", __func__, n_new);
 
     if (n_new > 0) {
@@ -6800,8 +6821,22 @@ static void wsp_ggml_build_forward_impl(struct wsp_ggml_cgraph * cgraph, struct 
     }
 }
 
+struct wsp_ggml_tensor * wsp_ggml_build_forward_select(
+        struct wsp_ggml_cgraph  * cgraph,
+        struct wsp_ggml_tensor ** tensors,
+        int                   n_tensors,
+        int                   idx) {
+    WSP_GGML_ASSERT(idx >= 0 && idx < n_tensors);
+
+    for (int i = 0; i < n_tensors; i++) {
+        wsp_ggml_build_forward_impl(cgraph, tensors[i], true, i == idx ? true : false);
+    }
+
+    return tensors[idx];
+}
+
 void wsp_ggml_build_forward_expand(struct wsp_ggml_cgraph * cgraph, struct wsp_ggml_tensor * tensor) {
-    wsp_ggml_build_forward_impl(cgraph, tensor, true);
+    wsp_ggml_build_forward_impl(cgraph, tensor, true, true);
 }
 
 void wsp_ggml_build_backward_expand(
@@ -7232,6 +7267,10 @@ bool wsp_ggml_can_fuse_subgraph_ext(const struct wsp_ggml_cgraph * cgraph,
             return false;
         }
 
+        if ((node->flags & WSP_GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+
         if (wsp_ggml_node_list_find_tensor(cgraph, outputs, num_outputs, node) != -1) {
             continue;
         }
@@ -7313,7 +7352,7 @@ static void wsp_ggml_graph_dump_dot_leaf_edge(FILE * fp, struct wsp_ggml_tensor 
             label);
 }
 
-void wsp_ggml_graph_dump_dot(const struct wsp_ggml_cgraph * gb, const struct wsp_ggml_cgraph * gf, const char * filename) {
+void wsp_ggml_graph_dump_dot(const struct wsp_ggml_cgraph * gb, const struct wsp_ggml_cgraph * cgraph, const char * filename) {
     char color[16];
 
     FILE * fp = wsp_ggml_fopen(filename, "w");
@@ -7334,7 +7373,7 @@ void wsp_ggml_graph_dump_dot(const struct wsp_ggml_cgraph * gb, const struct wsp
         if (node->flags & WSP_GGML_TENSOR_FLAG_PARAM) {
             snprintf(color, sizeof(color), "yellow");
         } else if (grad) {
-            if (wsp_ggml_graph_find(gf, node)) {
+            if (wsp_ggml_graph_find(cgraph, node)) {
                 snprintf(color, sizeof(color), "green");
             } else {
                 snprintf(color, sizeof(color), "lightblue");
@@ -7486,8 +7525,11 @@ void wsp_ggml_wsp_quantize_free(void) {
 
     wsp_iq2xs_free_impl(WSP_GGML_TYPE_IQ2_XXS);
     wsp_iq2xs_free_impl(WSP_GGML_TYPE_IQ2_XS);
+    wsp_iq2xs_free_impl(WSP_GGML_TYPE_IQ2_S);
     wsp_iq2xs_free_impl(WSP_GGML_TYPE_IQ1_S);
+    wsp_iq2xs_free_impl(WSP_GGML_TYPE_IQ1_M);
     wsp_iq3xs_free_impl(256);
+    wsp_iq3xs_free_impl(512);
 
     wsp_ggml_critical_section_end();
 }

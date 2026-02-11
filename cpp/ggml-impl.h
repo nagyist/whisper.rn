@@ -611,6 +611,9 @@ static inline bool wsp_ggml_can_fuse_ext(const struct wsp_ggml_cgraph * cgraph, 
         if (node->op != ops[i]) {
             return false;
         }
+        if ((node->flags & WSP_GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
         if (i < num_ops - 1 && !wsp_ggml_node_has_n_uses(cgraph, node_idxs[i], 1)) {
             return false;
         }

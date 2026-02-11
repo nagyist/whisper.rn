@@ -54,6 +54,7 @@ add_library(rnwhisper SHARED
     ${SOURCE_DIR}/ggml-alloc.c
     ${SOURCE_DIR}/ggml-backend.cpp
     ${SOURCE_DIR}/ggml-backend-reg.cpp
+    ${SOURCE_DIR}/ggml-backend-dl.cpp
     ${SOURCE_DIR}/ggml-cpu/amx/amx.cpp
     ${SOURCE_DIR}/ggml-cpu/amx/mmq.cpp
     ${SOURCE_DIR}/ggml-cpu/ggml-cpu.c

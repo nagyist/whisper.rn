@@ -6,7 +6,7 @@
 // This documentation is still a work in progress.
 // If you wish some specific topics to be covered, feel free to drop a comment:
 //
-//   https://github.com/ggerganov/whisper.cpp/issues/40
+//   https://github.com/ggml-org/whisper.cpp/issues/40
 //
 // ## Overview
 //
@@ -630,10 +630,11 @@ extern "C" {
 
     // this tensor...
     enum wsp_ggml_tensor_flag {
-        WSP_GGML_TENSOR_FLAG_INPUT  =  1, // ...is an input for the GGML compute graph
-        WSP_GGML_TENSOR_FLAG_OUTPUT =  2, // ...is an output for the GGML compute graph
-        WSP_GGML_TENSOR_FLAG_PARAM  =  4, // ...contains trainable parameters
-        WSP_GGML_TENSOR_FLAG_LOSS   =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
+        WSP_GGML_TENSOR_FLAG_INPUT   =  1, // ...is an input for the GGML compute graph
+        WSP_GGML_TENSOR_FLAG_OUTPUT  =  2, // ...is an output for the GGML compute graph
+        WSP_GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
+        WSP_GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
+        WSP_GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
     };
 
     enum wsp_ggml_tri_type {
@@ -2577,11 +2578,42 @@ extern "C" {
         struct wsp_ggml_tensor *  grad,
         struct wsp_ggml_tensor *  sgd_params); // alpha, weight decay
 
+    // build forward mutiple tensors and select one of them for computing
+    // this is useful for creating graphs that have constant topology but compute different things based on the input
+    // ref: https://github.com/ggml-org/llama.cpp/pull/18550
     //
-    // automatic differentiation
+    // nodes:
+    //   | - build forward into the graph but do not compute
+    //   c - build forward into the graph and compute
     //
+    //    |  |  ...  c  ...  |
+    //    |  |  ...  c  ...  |
+    //    |  |  ...  c  ...  |
+    //   [0  1  ... idx ...  n-1]        <-- wsp_ggml_build_forward_select(..., n, idx)
+    //               c
+    //               c
+    //
+    // example:
+    //   struct wsp_ggml_tensor * curs[3];
+    //
+    //   curs[0]  = compute0(...);
+    //   curs[1]  = compute1(...);
+    //   curs[2]  = compute2(...);
+    //
+    //   int idx = select_branch(some_input);
+    //
+    //   struct wsp_ggml_tensor * out = wsp_ggml_build_forward_select(cgraph, curs, 3, idx);
+    //
+    WSP_GGML_API struct wsp_ggml_tensor * wsp_ggml_build_forward_select(
+            struct wsp_ggml_cgraph  * cgraph,
+            struct wsp_ggml_tensor ** tensors,
+            int                   n_tensors,
+            int                   idx);
 
-    WSP_GGML_API void wsp_ggml_build_forward_expand(struct wsp_ggml_cgraph * cgraph, struct wsp_ggml_tensor * tensor);
+    WSP_GGML_API void wsp_ggml_build_forward_expand(
+            struct wsp_ggml_cgraph * cgraph,
+            struct wsp_ggml_tensor * tensor);
+
     WSP_GGML_API void wsp_ggml_build_backward_expand(
         struct wsp_ggml_context *  ctx,        // context for gradient computation
         struct wsp_ggml_cgraph  *  cgraph,
@@ -2613,7 +2645,7 @@ extern "C" {
     WSP_GGML_API void wsp_ggml_graph_print(const struct wsp_ggml_cgraph * cgraph);
 
     // dump the graph into a file using the dot format
-    WSP_GGML_API void wsp_ggml_graph_dump_dot(const struct wsp_ggml_cgraph * gb, const struct wsp_ggml_cgraph * gf, const char * filename);
+    WSP_GGML_API void wsp_ggml_graph_dump_dot(const struct wsp_ggml_cgraph * gb, const struct wsp_ggml_cgraph * cgraph, const char * filename);
 
     // TODO these functions were sandwiched in the old optimization interface, is there a better place for them?
     typedef void (*wsp_ggml_log_callback)(enum wsp_ggml_log_level level, const char * text, void * user_data);

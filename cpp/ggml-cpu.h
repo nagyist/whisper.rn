@@ -19,6 +19,9 @@ extern "C" {
         // abort wsp_ggml_graph_compute when true
         wsp_ggml_abort_callback abort_callback;
         void *              abort_callback_data;
+
+        // use only reference implementations
+        bool use_ref;
     };
 
     // numa strategies
@@ -131,6 +134,8 @@ extern "C" {
     WSP_GGML_BACKEND_API void wsp_ggml_backend_cpu_set_n_threads     (wsp_ggml_backend_t backend_cpu, int n_threads);
     WSP_GGML_BACKEND_API void wsp_ggml_backend_cpu_set_threadpool    (wsp_ggml_backend_t backend_cpu, wsp_ggml_threadpool_t threadpool);
     WSP_GGML_BACKEND_API void wsp_ggml_backend_cpu_set_abort_callback(wsp_ggml_backend_t backend_cpu, wsp_ggml_abort_callback abort_callback, void * abort_callback_data);
+
+    WSP_GGML_BACKEND_API void wsp_ggml_backend_cpu_set_use_ref(wsp_ggml_backend_t backend_cpu, bool use_ref);
 
     WSP_GGML_BACKEND_API wsp_ggml_backend_reg_t wsp_ggml_backend_cpu_reg(void);
 
