@@ -7,6 +7,8 @@
 ### Classes
 
 - [RealtimeTranscriber](../classes/realtime_transcription.RealtimeTranscriber.md)
+- [RingBuffer](../classes/realtime_transcription.RingBuffer.md)
+- [RingBufferVad](../classes/realtime_transcription.RingBufferVad.md)
 - [SliceManager](../classes/realtime_transcription.SliceManager.md)
 
 ### Interfaces
@@ -123,4 +125,4 @@ Key Parameters:
 
 #### Defined in
 
-[realtime-transcription/types.ts:61](https://github.com/mybigday/whisper.rn/blob/42bb2d5/src/realtime-transcription/types.ts#L61)
+[realtime-transcription/types.ts:62](https://github.com/mybigday/whisper.rn/blob/4d32378/src/realtime-transcription/types.ts#L62)
